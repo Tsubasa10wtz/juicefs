@@ -38,14 +38,20 @@ type fileSystem struct {
 	fuse.RawFileSystem
 	conf *vfs.Config
 	v    *vfs.VFS
+	t    *FileShadowTree
 }
 
 func newFileSystem(conf *vfs.Config, v *vfs.VFS) *fileSystem {
-	return &fileSystem{
+	fs := &fileSystem{
 		RawFileSystem: fuse.NewDefaultRawFileSystem(),
 		conf:          conf,
 		v:             v,
+		// t 不再直接初始化，稍后设置
 	}
+	fs.t = NewFileShadowTree(fs)  // 传递fs指针
+	config := v.Store.GetConfig() // 得到缓存大小等信息
+	fmt.Println(config.FreeSpace) // 测试
+	return fs
 }
 
 type setTimeout func(time.Duration)
@@ -81,12 +87,18 @@ func (fs *fileSystem) replyEntry(ctx *fuseContext, out *fuse.EntryOut, e *meta.E
 }
 
 func (fs *fileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) (status fuse.Status) {
+	// Lookup里记录路径，任何操作都要先经过都经过从Root开始的Lookup
+	fmt.Println("exec a Lookup: " + name)
 	ctx := fs.newContext(cancel, header)
 	defer releaseContext(ctx)
 	entry, err := fs.v.Lookup(ctx, Ino(header.NodeId), name)
 	if err != 0 {
+		// fmt.Println("Lookup: error")
 		return fuse.Status(err)
 	}
+	// 由一个Lookup生成函数生成路径上的节点
+	go fs.t.GenerateNode(name, Ino(header.NodeId), entry.Inode)
+
 	return fs.replyEntry(ctx, out, entry)
 }
 
@@ -196,6 +208,7 @@ func (fs *fileSystem) GetXAttr(cancel <-chan struct{}, header *fuse.InHeader, at
 }
 
 func (fs *fileSystem) ListXAttr(cancel <-chan struct{}, header *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
+	fmt.Println("exec a ListXAttr")
 	ctx := fs.newContext(cancel, header)
 	defer releaseContext(ctx)
 	data, err := fs.v.ListXattr(ctx, Ino(header.NodeId), len(dest))
@@ -231,7 +244,8 @@ func (fs *fileSystem) Create(cancel <-chan struct{}, in *fuse.CreateIn, name str
 	return fs.replyEntry(ctx, &out.EntryOut, entry)
 }
 
-func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
+func (fs *fileSystem) manuallyOpen(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
+	// Open意味着真正的访问
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
@@ -247,10 +261,42 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	return 0
 }
 
+func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
+	// Open意味着真正的访问
+	ctx := fs.newContext(cancel, &in.InHeader)
+	defer releaseContext(ctx)
+	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
+	if err != 0 {
+		return fuse.Status(err)
+	}
+	out.Fh = fh
+	if vfs.IsSpecialNode(Ino(in.NodeId)) {
+		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+	} else if entry.Attr.KeepCache {
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	}
+	go fs.t.processOpenFileAttr(Ino(in.NodeId), entry.Attr)
+	return 0
+}
+
 func (fs *fileSystem) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+	// Read记录偏移数，实现块级别的管理
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	n, err := fs.v.Read(ctx, Ino(in.NodeId), buf, in.Offset, in.Fh)
+	go fs.t.processRead(Ino(in.NodeId), in.Offset, in.Size)
+	if err != 0 {
+		return nil, fuse.Status(err)
+	}
+	return fuse.ReadResultData(buf[:n]), 0
+}
+
+// Remove 实现一个删除块的函数
+func (fs *fileSystem) Remove(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+	// Read记录偏移数，实现块级别的管理
+	ctx := fs.newContext(cancel, &in.InHeader)
+	defer releaseContext(ctx)
+	n, err := fs.v.Remove(ctx, Ino(in.NodeId), buf, in.Offset, in.Fh)
 	if err != 0 {
 		return nil, fuse.Status(err)
 	}
@@ -350,6 +396,7 @@ func (fs *fileSystem) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse
 }
 
 func (fs *fileSystem) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+	fmt.Println("exec a ReadDir")
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	entries, _, err := fs.v.Readdir(ctx, Ino(in.NodeId), in.Size, int(in.Offset), in.Fh, false)
@@ -366,6 +413,7 @@ func (fs *fileSystem) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse
 }
 
 func (fs *fileSystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
+	// 当使用ls或listdir命令时就是编号和计算编号总数的机会
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	entries, readAt, err := fs.v.Readdir(ctx, Ino(in.NodeId), in.Size, int(in.Offset), in.Fh, true)
@@ -375,6 +423,11 @@ func (fs *fileSystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *
 		de.Ino = uint64(e.Inode)
 		de.Name = string(e.Name)
 		de.Mode = e.Attr.SMode()
+		// fmt.Printf("%s : %d\n", de.Name, de.Ino)
+		if de.Name != "." && de.Name != ".." {
+			go fs.t.UpdateFileNumUnderDir(de.Ino, Ino(in.NodeId))
+		}
+
 		eo := out.AddDirLookupEntry(de)
 		if eo == nil {
 			break

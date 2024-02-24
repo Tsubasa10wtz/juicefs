@@ -23,6 +23,7 @@ import (
 
 type Reader interface {
 	ReadAt(ctx context.Context, p *Page, off int) (int, error)
+	RemoveAt(ctx context.Context, p *Page, off int) (int, error)
 }
 
 type Writer interface {
@@ -43,4 +44,5 @@ type ChunkStore interface {
 	CheckCache(id uint64, length uint32) (uint64, error)
 	UsedMemory() int64
 	UpdateLimit(upload, download int64)
+	GetConfig() *Config
 }

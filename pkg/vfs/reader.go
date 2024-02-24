@@ -69,6 +69,7 @@ func (m sstate) String() string {
 type FileReader interface {
 	Read(ctx meta.Context, off uint64, buf []byte) (int, syscall.Errno)
 	Close(ctx meta.Context)
+	Remove(ctx meta.Context, off uint64, buf []byte) (int, syscall.Errno)
 }
 
 type DataReader interface {
@@ -229,6 +230,79 @@ func (s *sliceReader) run() {
 	}
 }
 
+func (s *sliceReader) removeRun() {
+	f := s.file
+	f.Lock()
+	defer f.Unlock()
+	if s.state != NEW || f.shouldStop() {
+		s.done(0, 0)
+	}
+	s.state = BUSY
+	indx := s.indx
+	inode := f.inode
+	f.Unlock()
+
+	f.Lock()
+	length := f.length
+	f.Unlock()
+	var slices []meta.Slice
+	err := f.r.m.Read(meta.Background, inode, indx, &slices)
+	f.Lock()
+	if s.state != BUSY || f.err != 0 || f.closing {
+		s.done(0, 0)
+	}
+	if err == syscall.ENOENT {
+		s.done(err, 0)
+	} else if err != 0 {
+		f.tried++
+		trycnt := f.tried
+		if trycnt > f.r.maxRetries {
+			s.done(syscall.EIO, 0)
+		} else {
+			s.done(0, retry_time(trycnt))
+		}
+	}
+
+	s.currentPos = 0
+	if s.block.off > length {
+		s.block.len = 0
+		s.state = READY
+		s.done(0, 0)
+	} else if s.block.end() > length {
+		s.block.len = length - s.block.off
+	}
+	need := s.block.len
+	f.Unlock()
+
+	p := s.page.Slice(0, int(need))
+	defer p.Release()
+	var n int
+	ctx := context.TODO()
+	n = f.r.Remove(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
+
+	f.Lock()
+	if s.state != BUSY || f.shouldStop() {
+		s.done(0, 0)
+	}
+	if n == int(need) {
+		s.state = READY
+		s.currentPos = uint32(n)
+		s.file.tried = 0
+		s.lastAccess = time.Now()
+		s.done(0, 0)
+	} else {
+		s.currentPos = 0 // start again from beginning
+		err = syscall.EIO
+		f.tried++
+		_ = f.r.m.InvalidateChunkCache(meta.Background, inode, indx)
+		if f.tried > f.r.maxRetries {
+			s.done(err, 0)
+		} else {
+			s.done(0, retry_time(f.tried))
+		}
+	}
+}
+
 func (s *sliceReader) invalidate() {
 	switch s.state {
 	case NEW:
@@ -320,6 +394,31 @@ func (f *fileReader) newSlice(block *frange) *sliceReader {
 	*(f.last) = s
 	f.last = &(s.next)
 	go s.run()
+	atomic.AddInt64(&readBufferUsed, int64(s.block.len))
+	return s
+}
+
+func (f *fileReader) newRemoveSlice(block *frange) *sliceReader {
+	s := &sliceReader{}
+	s.file = f
+	s.lastAccess = time.Now()
+	s.indx = uint32(block.off / meta.ChunkSize)
+	s.block = &frange{block.off, block.len} // random read
+	blockend := (block.off/f.r.blockSize + 1) * f.r.blockSize
+	if s.block.end() > f.length {
+		s.block.len = f.length - s.block.off
+	}
+	if s.block.end() > blockend {
+		s.block.len = blockend - s.block.off
+	}
+	block.off = s.block.end()
+	block.len -= s.block.len
+	s.page = chunk.NewOffPage(int(s.block.len))
+	s.cond = utils.NewCond(&f.Mutex)
+	s.prev = f.last
+	*(f.last) = s
+	f.last = &(s.next)
+	go s.removeRun()
 	atomic.AddInt64(&readBufferUsed, int64(s.block.len))
 	return s
 }
@@ -569,6 +668,31 @@ func (f *fileReader) prepareRequests(ranges []uint64) []*req {
 	return reqs
 }
 
+func (f *fileReader) prepareRemoveRequests(ranges []uint64) []*req {
+	var reqs []*req
+	edges := len(ranges)
+	for i := 0; i < edges-1; i++ {
+		var added bool
+		b := frange{ranges[i], ranges[i+1] - ranges[i]}
+		f.visit(func(s *sliceReader) {
+			if !added && s.state.valid() && s.block.include(&b) {
+				s.refs++
+				s.lastAccess = time.Now()
+				reqs = append(reqs, &req{frange{ranges[i] - s.block.off, b.len}, s})
+				added = true
+			}
+		})
+		if !added {
+			for b.len > 0 {
+				s := f.newRemoveSlice(&b)
+				s.refs++
+				reqs = append(reqs, &req{frange{0, s.block.len}, s})
+			}
+		}
+	}
+	return reqs
+}
+
 func (f *fileReader) shouldStop() bool {
 	return f.err != 0 || f.closing
 }
@@ -648,6 +772,49 @@ func (f *fileReader) Read(ctx meta.Context, offset uint64, buf []byte) (int, sys
 	}()
 	f.checkReadahead(block)
 	return f.waitForIO(ctx, reqs, buf)
+}
+
+func (f *fileReader) Remove(ctx meta.Context, offset uint64, buf []byte) (int, syscall.Errno) {
+	f.Lock()
+	defer f.Unlock()
+	f.acquire()
+	defer f.release()
+
+	if f.err != 0 || f.closing {
+		return 0, f.err
+	}
+
+	size := uint64(len(buf))
+	if offset >= f.length || size == 0 {
+		return 0, 0
+	}
+	block := &frange{offset, size}
+	if block.end() > f.length {
+		block.len = f.length - block.off
+	}
+
+	f.cleanupRequests(block)
+	var lastBS uint64 = 32 << 10
+	if block.off+lastBS > f.length {
+		lastblock := frange{f.length - lastBS, lastBS}
+		if f.length < lastBS {
+			lastblock = frange{0, f.length}
+		}
+		f.readAhead(&lastblock)
+	}
+	ranges := f.splitRange(block)
+	reqs := f.prepareRemoveRequests(ranges)
+	defer func() {
+		for _, req := range reqs {
+			s := req.s
+			s.refs--
+			if s.refs == 0 && s.state == INVALID {
+				s.delete()
+			}
+		}
+	}()
+	f.checkReadahead(block)
+	return 0, 0
 }
 
 func (f *fileReader) visit(fn func(s *sliceReader)) {
@@ -811,6 +978,33 @@ func (r *dataReader) readSlice(ctx context.Context, s *meta.Slice, page *chunk.P
 	return nil
 }
 
+func (r *dataReader) removeSlice(ctx context.Context, s *meta.Slice, page *chunk.Page, off int) error {
+	buf := page.Data
+	read := 0
+	if s.Id == 0 {
+		for read < len(buf) {
+			buf[read] = 0
+			read++
+		}
+		return nil
+	}
+
+	reader := r.store.NewReader(s.Id, int(s.Size))
+	for read < len(buf) {
+		p := page.Slice(read, len(buf)-read)
+		n, err := reader.RemoveAt(ctx, p, off+int(s.Off))
+		p.Release()
+		if n == 0 && err != nil {
+			logger.Warningf("fail to read sliceId %d (off:%d, size:%d, clen: %d): %s",
+				s.Id, off+int(s.Off), len(buf)-read, s.Size, err)
+			return err
+		}
+		read += n
+		off += n
+	}
+	return nil
+}
+
 func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.Slice, offset uint32) int {
 	if len(slices) > 16 {
 		return r.readManySlices(ctx, page, slices, offset)
@@ -827,6 +1021,47 @@ func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.S
 			go func(s *meta.Slice, p *chunk.Page, off, pos uint32) {
 				defer p.Release()
 				errs <- r.readSlice(ctx, s, p, int(off))
+			}(&slices[i], page.Slice(read, toread), offset-pos, pos)
+			read += toread
+			offset += uint32(toread)
+			waits++
+		}
+		pos += slices[i].Len
+	}
+	for read < size {
+		buf[read] = 0
+		read++
+	}
+	var err error
+	// wait for all goroutine to return, otherwise they may access invalid memory
+	for waits > 0 {
+		if e := <-errs; e != nil {
+			err = e
+		}
+		waits--
+	}
+	if err != nil {
+		return 0
+	}
+	return read
+}
+
+func (r *dataReader) Remove(ctx context.Context, page *chunk.Page, slices []meta.Slice, offset uint32) int {
+	//if len(slices) > 16 {
+	//	return r.readManySlices(ctx, page, slices, offset)
+	//} 这里待定
+	read := 0
+	var pos uint32
+	errs := make(chan error, 10)
+	waits := 0
+	buf := page.Data
+	size := len(buf)
+	for i := 0; i < len(slices); i++ {
+		if read < size && offset < pos+slices[i].Len {
+			toread := utils.Min(size-read, int(pos+slices[i].Len-offset))
+			go func(s *meta.Slice, p *chunk.Page, off, pos uint32) {
+				defer p.Release()
+				errs <- r.removeSlice(ctx, s, p, int(off))
 			}(&slices[i], page.Slice(read, toread), offset-pos, pos)
 			read += toread
 			offset += uint32(toread)

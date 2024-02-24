@@ -196,6 +196,11 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	return len(p), nil
 }
 
+func (s *rSlice) RemoveAt(ctx context.Context, page *Page, off int) (n int, err error) {
+	s.Remove()
+	return 0, nil
+}
+
 func (s *rSlice) delete(indx int) error {
 	key := s.key(indx)
 	st := time.Now()
@@ -798,6 +803,10 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 	}
 	store.regMetrics(reg)
 	return store
+}
+
+func (store *cachedStore) GetConfig() *Config {
+	return &store.conf
 }
 
 func (store *cachedStore) initMetrics() {

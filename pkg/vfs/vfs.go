@@ -18,6 +18,7 @@ package vfs
 
 import (
 	"encoding/json"
+	"fmt"
 	"runtime"
 	"sort"
 	"sync"
@@ -441,6 +442,7 @@ func (v *VFS) Open(ctx Context, ino Ino, flags uint32) (entry *meta.Entry, fh ui
 	}
 
 	err = v.Meta.Open(ctx, ino, flags, attr)
+	fmt.Println(attr.Length)
 	if err == 0 {
 		v.UpdateLength(ino, attr)
 		fh = v.newFileHandle(ino, attr.Length, flags)
@@ -600,6 +602,76 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 
 	_ = v.writer.Flush(ctx, ino)
 	n, err = h.reader.Read(ctx, off, buf)
+	for err == syscall.EAGAIN {
+		n, err = h.reader.Read(ctx, off, buf)
+	}
+	if err == syscall.ENOENT {
+		err = syscall.EBADF
+	}
+	h.removeOp(ctx)
+	return
+}
+
+// Remove 模仿Read写成
+func (v *VFS) Remove(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n int, err syscall.Errno) {
+	size := uint32(len(buf))
+	if IsSpecialNode(ino) {
+		if ino == logInode {
+			n = readAccessLog(fh, buf)
+		} else {
+			defer func() { logit(ctx, "read (%d,%d,%d,%d): %s (%d)", ino, size, off, fh, strerr(err), n) }()
+			if ino == controlInode && runtime.GOOS == "darwin" {
+				fh = v.getControlHandle(ctx.Pid())
+			}
+			h := v.findHandle(ino, fh)
+			if h == nil {
+				err = syscall.EBADF
+				return
+			}
+			h.Lock()
+			defer h.Unlock()
+			if off < h.off {
+				logger.Errorf("read dropped data from %s: %d < %d", ino, off, h.off)
+				err = syscall.EIO
+				return
+			}
+			if int(off-h.off) < len(h.data) {
+				n = copy(buf, h.data[off-h.off:])
+			}
+			if len(h.data) > 2<<20 && off-h.off > 1<<20 {
+				// drop first part to avoid OOM
+				h.off += 1 << 20
+				h.data = h.data[1<<20:]
+			}
+		}
+		return
+	}
+
+	defer func() {
+		readSizeHistogram.Observe(float64(n))
+		logit(ctx, "read (%d,%d,%d): %s (%d)", ino, size, off, strerr(err), n)
+	}()
+	h := v.findHandle(ino, fh)
+	if h == nil {
+		err = syscall.EBADF
+		return
+	}
+	if off >= maxFileSize || off+uint64(size) >= maxFileSize {
+		err = syscall.EFBIG
+		return
+	}
+	if h.reader == nil {
+		err = syscall.EBADF
+		return
+	}
+	if !h.Rlock(ctx) {
+		err = syscall.EINTR
+		return
+	}
+	defer h.Runlock()
+
+	_ = v.writer.Flush(ctx, ino)
+	n, err = h.reader.Remove(ctx, off, buf)
 	for err == syscall.EAGAIN {
 		n, err = h.reader.Read(ctx, off, buf)
 	}
