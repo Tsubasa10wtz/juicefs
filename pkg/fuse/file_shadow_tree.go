@@ -2,11 +2,11 @@ package fuse
 
 import (
 	"container/list"
-	"fmt"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"math"
 	"os"
 	"sort"
+	"strings"
 )
 
 // 静态变量，对包级别是全局的
@@ -47,26 +47,27 @@ type FileShadowNode struct {
 	NumSub           uint64 //子文件或目录数量
 	maxI             uint64
 	minI             uint64
-	childList        []Ino
+	childList        []*FileShadowNode
 	inode            Ino //对应的Inode
 	isManagementNode bool
 	isOpen           bool
-	frange           []Range
-	length           uint64 // 主要记录文件数量
+	length           uint64 // 主要记录文件
+	hasJudged        bool   //这个节点是否已经作为上层文件夹被判断过
 }
 
 func NewFileShadowNode(p string, i Ino, f *FileShadowNode) *FileShadowNode {
 	return &FileShadowNode{
 		pathName:         p,
 		father:           f,
+		cacheUnitNode:    nil,
 		NumSub:           0, // 次级目录文件总数
 		maxI:             0,
 		minI:             math.MaxInt64,
-		childList:        make([]Ino, 0),
+		childList:        make([]*FileShadowNode, 0),
 		inode:            i,
 		isManagementNode: false,
 		isOpen:           false,
-		frange:           make([]Range, 0),
+		hasJudged:        false,
 	}
 }
 
@@ -80,7 +81,7 @@ type FileShadowTree struct {
 	filePathMaintained int
 	accessNum          int
 	root               *FileShadowNode
-	lastLevelDirNode   []*FileShadowNode
+	unitNodeList       []*FileShadowNode
 	nodeToCache        map[*FileShadowNode]*CacheUnit
 	totalCapacity      int
 	freeCapacity       uint64
@@ -94,7 +95,7 @@ func NewFileShadowTree(fs *fileSystem) *FileShadowTree {
 		fs:               fs,
 		nodeNum:          0,
 		root:             NewFileShadowNode("/", 1, nil), // 初始化 root 节点
-		lastLevelDirNode: make([]*FileShadowNode, 0),
+		unitNodeList:     make([]*FileShadowNode, 0),
 		nodeToCache:      make(map[*FileShadowNode]*CacheUnit),
 		totalCapacity:    6144,
 		freeCapacity:     6144,
@@ -106,25 +107,26 @@ func NewFileShadowTree(fs *fileSystem) *FileShadowTree {
 	return tree
 }
 
-// GenerateNode 根据fuse.Lookup的分解生成节点建树，使用Inod没有重名冲突
-func (t *FileShadowTree) GenerateNode(name string, ip Ino, ic Ino) {
+// GenerateNode 根据fuse.Lookup的分解生成节点建树，使用Inode没有重名冲突
+func (t *FileShadowTree) GenerateNode(name string, ip Ino, ic Ino, out *fuse.EntryOut) {
 	// TODO: 更新时间以及根据时间剪枝
 	// 如果已经生成
-	fmt.Println(ic)
 	// 孩子节点已经存在或该节点的父母不存在，则不需要建立新节点
 	_, exists := t.m[ic]
-	if exists {
+	if !exists {
 		return
 	}
+
 	parent, exists := t.m[ip]
 	if !exists {
 		return
 	}
+
 	// 建立父节点和子节点关系
 	node := NewFileShadowNode(name, ic, parent)
-	parent.childList = append(t.m[ip].childList, ic)
-	// inode到节点映射
+	parent.childList = append(t.m[ip].childList, node)
 	t.m[ic] = node
+
 }
 
 // 调用一个接口来释放缓存
@@ -159,7 +161,7 @@ func (t *FileShadowTree) TuneCacheCapacity() {
 	var cacheWithPattern []*CacheUnit
 
 	// 遍历已经记录的最后一级节点
-	for _, n := range t.lastLevelDirNode {
+	for _, n := range t.unitNodeList {
 		c := t.nodeToCache[n]
 		c.JudgeThePattern()
 		if c.pattern != 'u' {
@@ -232,37 +234,81 @@ func (t *FileShadowTree) TuneCacheCapacity() {
 	}
 }
 
-// processOpenFileAttr 根据fuse.Open打开文件进行处理
-func (t *FileShadowTree) processOpenFileAttr(i Ino, attr *Attr) {
+func (n *FileShadowNode) judgeSementic() bool {
+	arr := make([]string, 0)
+	for _, node := range n.childList {
+		arr = append(arr, node.pathName)
+	}
+
+	if len(arr) == 0 {
+		return false
+	}
+
+	// TODO：可以进一步细化方法
+	first := arr[0][:3] // 取第一个字符串的前三位作为比较基准
+	for _, str := range arr {
+		if len(str) < 3 || !strings.HasPrefix(str, first) {
+			return false
+		}
+	}
+	return true
+}
+
+// processOpen 根据fuse.Open打开文件进行处理
+func (t *FileShadowTree) processOpen(i Ino, attr *Attr) {
 	n, exists := t.m[i]
 	if !exists {
 		return
 	}
+
+	// 调整轮次
 	t.accessNum++
 	if t.accessNum%200 == 0 {
 		t.TuneCacheCapacity()
 	}
-	n.isOpen = true
-	t.m[i].length = attr.Length // 记录一个文件的大小
-	s := t.m[i].father
-	t.m[i].cacheUnitNode = s // 暂时认为缓存管理由其father进行
-	cacheUnit, exists := t.nodeToCache[s]
-	if exists {
-		cacheUnit.accessWindow = append(cacheUnit.accessWindow, i)
-		if len(cacheUnit.accessWindow) > accessWindowSize {
-			cacheUnit.accessWindow = cacheUnit.accessWindow[1:]
-		}
-		return
-	}
 
-	s.isManagementNode = true
-	// 记录最后一级目录节点，作为缓存管理的单位
-	t.lastLevelDirNode = append(t.lastLevelDirNode, s)
-	// 构造一个CacheUnit，和最后一层目录产生映射
-	// 构造时传入node，可以访问node的所有信息
-	c := NewCacheUnit(s, t)
-	c.nrFileTotal = s.NumSub //获得目录下文件总数
-	t.nodeToCache[s] = c
+	n.isOpen = true
+	n.length = attr.Length // 记录一个文件的大小
+
+	f := n.father
+	ff := f.father
+
+	// 如果上上层节点已经作为一个缓存管理单元管理
+	if c, exists := t.nodeToCache[ff]; exists {
+		// 如果上上层节点已经作为一个大的缓存单元
+		n.cacheUnitNode = ff
+		c.accessWindow = append(c.accessWindow, c.dirMap[f])
+	} else {
+		// 如果上上层节点没有判断是否能作为缓存单元
+		// 判断是否可以作为缓存管理单元, 如果已经判断过不行为false，不能重复判断
+		if !ff.hasJudged {
+			// 判断语义信息
+			if ff.judgeSementic() {
+				// 如果存在语义信息,建立一个新的newCache
+				newCache := NewCacheUnit(ff, t)
+				newCache.updateInformation()
+				newCache.accessWindow = append(newCache.accessWindow, newCache.dirMap[f])
+				n.cacheUnitNode = ff
+				t.nodeToCache[ff] = newCache
+			}
+
+			ff.hasJudged = true
+		}
+
+		// 上上层节点不能作为缓存单元
+		// 判断上层节点
+		if c1, e1 := t.nodeToCache[f]; e1 {
+			// 上层已经作为节点
+			c1.accessWindow = append(c1.accessWindow, uint64(i))
+		} else {
+			newCache := NewCacheUnit(f, t)
+			newCache.nrFileTotal = f.NumSub
+			newCache.accessWindow = append(newCache.accessWindow, uint64(i))
+			t.nodeToCache[f] = newCache
+
+		}
+
+	}
 }
 
 func (t *FileShadowTree) processRead(ino Ino, offset uint64, size uint32) {
@@ -412,10 +458,11 @@ type CacheUnit struct {
 	ratioRecorder []float64
 	node          *FileShadowNode
 	nrFileTotal   uint64
+	nrDirTotal    uint64 //目录数，如果有
 	cacheSize     uint64
 	cache         LRU //维护缓存项，到LRU的映射
 	windowSize    int
-	accessWindow  []Ino
+	accessWindow  []uint64
 	pattern       rune
 	reuseWindow   LRU //维护重用项
 	reuseNum      int
@@ -425,24 +472,28 @@ type CacheUnit struct {
 	nrAccess      uint64 //用于辅助本轮计算的访问块数目
 	nrHit         int
 	nrMiss        int
+	isHighLevel   bool                       // 是否是管理多个目录的更高级目录
+	dirMap        map[*FileShadowNode]uint64 // 目录编映射，如果有
 }
 
 func NewCacheUnit(node *FileShadowNode, tree *FileShadowTree) *CacheUnit {
 	u := &CacheUnit{
 		tree:         tree,
 		node:         node,
-		cacheSize:    6144, //待定值
+		cacheSize:    6144, //待定值, 可以在配置中读取后计算获得
 		windowSize:   30,
 		pattern:      'u',
-		accessWindow: make([]Ino, 0),
+		accessWindow: make([]uint64, 0),
 		reuseWindow: LRU{
 			ll: list.New(),
 			m:  make(map[fileBlockPair]*list.Element),
 		},
-		reuseNum: 0,
-		nrAccess: 0,
-		nrHit:    0,
-		nrMiss:   0,
+		reuseNum:    0,
+		nrAccess:    0,
+		nrHit:       0,
+		nrMiss:      0,
+		isHighLevel: false,
+		dirMap:      make(map[*FileShadowNode]uint64),
 	}
 	u.cache.ll = list.New()
 	u.cache.m = make(map[fileBlockPair]*list.Element)
@@ -457,7 +508,19 @@ func NewCacheUnit(node *FileShadowNode, tree *FileShadowTree) *CacheUnit {
 	return u
 }
 
-func (u *CacheUnit) JudgeIfStridePattern(window []Ino) bool {
+// updateInformation 更新目录相关信息
+func (u *CacheUnit) updateInformation() {
+	node := u.node
+	for index, n := range node.childList {
+		// 更新目录编号表
+		u.dirMap[n] = uint64(index)
+		// 更新总文件数量
+		u.nrFileTotal += n.NumSub
+	}
+
+}
+
+func (u *CacheUnit) JudgeIfStridePattern(window []uint64) bool {
 	size := len(window)
 	if size < 3 {
 		return false
@@ -478,7 +541,7 @@ func (u *CacheUnit) JudgeIfStridePattern(window []Ino) bool {
 	return flag
 }
 
-func (u *CacheUnit) CalculateGapDistributionGaussian(window []Ino) Pair {
+func (u *CacheUnit) CalculateGapDistributionGaussian(window []uint64) Pair {
 	var avg, std, nrSample float64
 	const defaultStd, minStd = 10.0, 3.0
 	size := len(window)
@@ -509,7 +572,7 @@ func (u *CacheUnit) JudgeDistribution(p Pair) bool {
 	return false
 }
 
-func (u *CacheUnit) JudgeIfRandomPattern(window []Ino) bool {
+func (u *CacheUnit) JudgeIfRandomPattern(window []uint64) bool {
 	size := len(window)
 	if size < 10 {
 		return false
@@ -586,10 +649,10 @@ func (u *CacheUnit) TuneCapacityAndFree(goalSize uint64) {
 
 	// 需要释放缓存缓存大小
 	var capacityToFree uint64
-	if uint64(u.cache.used) < goalSize {
+	if u.cache.used < goalSize {
 		capacityToFree = 0
 	} else {
-		capacityToFree = uint64(u.cache.used) - goalSize
+		capacityToFree = u.cache.used - goalSize
 	}
 
 	// 释放 virtualCache 头部的元素

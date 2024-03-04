@@ -48,9 +48,9 @@ func newFileSystem(conf *vfs.Config, v *vfs.VFS) *fileSystem {
 		v:             v,
 		// t 不再直接初始化，稍后设置
 	}
-	fs.t = NewFileShadowTree(fs)  // 传递fs指针
-	config := v.Store.GetConfig() // 得到缓存大小等信息
-	fmt.Println(config.FreeSpace) // 测试
+	fs.t = NewFileShadowTree(fs) // 传递fs指针
+	// config := v.Store.GetConfig() // 得到缓存大小等信息
+	// fmt.Println(config.FreeSpace) // 测试
 	return fs
 }
 
@@ -88,7 +88,7 @@ func (fs *fileSystem) replyEntry(ctx *fuseContext, out *fuse.EntryOut, e *meta.E
 
 func (fs *fileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) (status fuse.Status) {
 	// Lookup里记录路径，任何操作都要先经过都经过从Root开始的Lookup
-	fmt.Println("exec a Lookup: " + name)
+	// fmt.Println("exec a Lookup: " + name)
 	ctx := fs.newContext(cancel, header)
 	defer releaseContext(ctx)
 	entry, err := fs.v.Lookup(ctx, Ino(header.NodeId), name)
@@ -97,12 +97,14 @@ func (fs *fileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name
 		return fuse.Status(err)
 	}
 	// 由一个Lookup生成函数生成路径上的节点
-	go fs.t.GenerateNode(name, Ino(header.NodeId), entry.Inode)
+	go fs.t.GenerateNode(name, Ino(header.NodeId), entry.Inode, out)
 
 	return fs.replyEntry(ctx, out, entry)
 }
 
 func (fs *fileSystem) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.AttrOut) (code fuse.Status) {
+	fmt.Print("exec a GetAttr: ")
+	fmt.Println(in.NodeId)
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	var opened uint8
@@ -245,7 +247,7 @@ func (fs *fileSystem) Create(cancel <-chan struct{}, in *fuse.CreateIn, name str
 }
 
 func (fs *fileSystem) manuallyOpen(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
-	// Open意味着真正的访问
+	// 手动打开一个文件
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
@@ -275,7 +277,7 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	} else if entry.Attr.KeepCache {
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	}
-	go fs.t.processOpenFileAttr(Ino(in.NodeId), entry.Attr)
+	go fs.t.processOpen(Ino(in.NodeId), entry.Attr)
 	return 0
 }
 
@@ -414,6 +416,7 @@ func (fs *fileSystem) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse
 
 func (fs *fileSystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 	// 当使用ls或listdir命令时就是编号和计算编号总数的机会
+	fmt.Printf("exec a ReadDirPlus : %d\n", in.NodeId)
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	entries, readAt, err := fs.v.Readdir(ctx, Ino(in.NodeId), in.Size, int(in.Offset), in.Fh, true)
