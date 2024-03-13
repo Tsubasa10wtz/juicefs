@@ -109,14 +109,14 @@ func NewFileShadowTree(fs *fileSystem) *FileShadowTree {
 
 // GenerateNode 根据fuse.Lookup的分解生成节点建树，使用Inode没有重名冲突
 func (t *FileShadowTree) GenerateNode(name string, ip Ino, ic Ino, out *fuse.EntryOut) {
-	// TODO: 更新时间以及根据时间剪枝
-	// 如果已经生成
-	// 孩子节点已经存在或该节点的父母不存在，则不需要建立新节点
+	// TODO: 可以根据fuse.EntryOut实现更多功能
+
 	_, exists := t.m[ic]
-	if !exists {
+	if exists {
 		return
 	}
 
+	// 该节点的父母不存在
 	parent, exists := t.m[ip]
 	if !exists {
 		return
@@ -147,7 +147,7 @@ func (t *FileShadowTree) manuallyRemove(ino Ino, offset uint64, size uint32) {
 	rin.Gid = uint32(os.Getgid())
 	rin.Uid = uint32(os.Getuid())
 	// 把要删除的偏移给放进去ReadIn的参数里去
-	rin.NodeId = uint64(ino) //换成实际要释放的NodeId
+	rin.NodeId = uint64(ino) //实际要释放的NodeId
 	rin.Offset = offset
 	rin.Size = size
 	rin.Fh = fh
@@ -299,12 +299,14 @@ func (t *FileShadowTree) processOpen(i Ino, attr *Attr) {
 		// 判断上层节点
 		if c1, e1 := t.nodeToCache[f]; e1 {
 			// 上层已经作为节点
+			n.cacheUnitNode = f
 			c1.accessWindow = append(c1.accessWindow, uint64(i))
 		} else {
 			newCache := NewCacheUnit(f, t)
 			newCache.nrFileTotal = f.NumSub
 			newCache.accessWindow = append(newCache.accessWindow, uint64(i))
 			t.nodeToCache[f] = newCache
+			n.cacheUnitNode = f
 
 		}
 
