@@ -2,7 +2,9 @@ package fuse
 
 import (
 	"container/list"
+	"fmt"
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/juicedata/juicefs/pkg/meta"
 	"math"
 	"os"
 	"sort"
@@ -19,6 +21,7 @@ const (
 	BlockSize          = 4 << 20
 	accessWindowSize   = 30
 	MaxCapacity        = 4194304 // 最大缓存
+	NumToTuneCapacity  = 1000
 )
 
 type Pair struct {
@@ -51,8 +54,11 @@ type FileShadowNode struct {
 	inode            Ino //对应的Inode
 	isManagementNode bool
 	isOpen           bool
-	length           uint64 // 主要记录文件
-	hasJudged        bool   //这个节点是否已经作为上层文件夹被判断过
+	length           uint64   // 主要记录文件
+	hasJudged        bool     //这个节点是否已经作为上层文件夹被判断过
+	isFile           bool     //是一个文件节点
+	isDir            bool     //是一个文件夹节点
+	readBlockIds     []uint64 //用于跨文件预取
 }
 
 func NewFileShadowNode(p string, i Ino, f *FileShadowNode) *FileShadowNode {
@@ -68,6 +74,7 @@ func NewFileShadowNode(p string, i Ino, f *FileShadowNode) *FileShadowNode {
 		isManagementNode: false,
 		isOpen:           false,
 		hasJudged:        false,
+		readBlockIds:     make([]uint64, 0),
 	}
 }
 
@@ -124,6 +131,7 @@ func (t *FileShadowTree) GenerateNode(name string, ip Ino, ic Ino, out *fuse.Ent
 
 	// 建立父节点和子节点关系
 	node := NewFileShadowNode(name, ic, parent)
+	node.isDir = true // 默认为目录节点
 	parent.childList = append(t.m[ip].childList, node)
 	t.m[ic] = node
 
@@ -152,7 +160,7 @@ func (t *FileShadowTree) manuallyRemove(ino Ino, offset uint64, size uint32) {
 	rin.Size = size
 	rin.Fh = fh
 	// 借用ReadIn假调用一次获得rSlice来remove缓存
-	_, _ = t.fs.Remove(fakeCancel, rin, fakeBuf)
+	t.fs.Remove(fakeCancel, rin, fakeBuf)
 
 }
 
@@ -254,6 +262,92 @@ func (n *FileShadowNode) judgeSementic() bool {
 	return true
 }
 
+func (t *FileShadowTree) prune(f *FileShadowNode) {
+	// 不需要剪枝
+	if len(f.childList) <= 10 {
+		return
+	}
+
+	x := len(f.childList) - 10
+
+	// 剪枝，先释放掉超过10个的节点
+	// TODO：加入时间维度，剪去最早被访问比较好，但是不影响整体
+	for i := 0; i < x; i++ {
+		// 删除映射关系
+		c := f.childList[i]
+		delete(t.nodeToCache, c)
+		c = nil
+	}
+
+	f.childList = f.childList[x:]
+}
+
+func (t *FileShadowTree) prefetch(c *CacheUnit, n *FileShadowNode) {
+	// Todo: 不一定需要判断，一样可以跨文件夹预取
+	//if c.isHighLevel == true {
+	//	// 高层级节点可以做文件夹整体的预取，考虑开销问题
+	//} else {
+	//}
+
+	// 普通的文件夹内预取
+	f := n.father
+	l := len(f.childList)
+	if l < 2 {
+		fmt.Println("too short childList, don't do prefetch")
+	} else {
+		// 因为具有可迁移性，认为用第一个文件读的块去迁移所有文件读的块
+		readBlockIds := f.childList[0].readBlockIds
+		// 向后预取五项, 首先打开这五个文件
+		for i := 0; i < 5; i++ {
+			// 执行Open操作
+			var oin *fuse.OpenIn
+			oin.Pid = uint32(os.Getpid())
+			oin.Gid = uint32(os.Getgid())
+			oin.Uid = uint32(os.Getuid())
+			var oout *fuse.OpenOut
+			oin.NodeId = uint64(n.inode) + uint64(i+1)
+			fakeCancel := make(chan struct{})
+			// 获得文件信息
+			e := t.fs.manuallyOpen(fakeCancel, oin, oout)
+			// 如果不是文件就可以预取
+			if e.Attr.Typ == meta.TypeDirectory {
+				continue
+			}
+			fh := oout.Fh
+
+			fileLength := e.Attr.Length
+			lastBlock := (fileLength - 1) / BlockSize
+
+			// 执行Read操作
+			for _, blk := range readBlockIds {
+				//用读取来缓存块
+				var rin *fuse.ReadIn
+				var fakeBuf []byte // 假buf
+				rin.Pid = uint32(os.Getpid())
+				rin.Gid = uint32(os.Getgid())
+				rin.Uid = uint32(os.Getuid())
+				// 把要删除的偏移给放进去ReadIn的参数里去
+				rin.NodeId = uint64(n.inode) //实际要释放的NodeId
+				rin.Fh = fh
+				if blk != lastBlock {
+					// 如果不是文件的最后一块，是一个完整的块
+					c.cache.Add(fileBlockPair{n.inode, blk}, BlockSize)
+					rin.Offset = blk * BlockSize
+					rin.Size = BlockSize
+					t.fs.mannuallyRead(fakeCancel, rin, fakeBuf)
+				} else {
+					// 如果是最后一块，需要另外计算缓存占用
+					c.cache.Add(fileBlockPair{n.inode, blk}, uint32((fileLength-1)%BlockSize+1))
+					rin.Offset = blk * BlockSize
+					rin.Size = uint32((fileLength-1)%BlockSize + 1)
+					t.fs.mannuallyRead(fakeCancel, rin, fakeBuf)
+				}
+			}
+
+		}
+	}
+}
+
 // processOpen 根据fuse.Open打开文件进行处理
 func (t *FileShadowTree) processOpen(i Ino, attr *Attr) {
 	n, exists := t.m[i]
@@ -261,9 +355,13 @@ func (t *FileShadowTree) processOpen(i Ino, attr *Attr) {
 		return
 	}
 
+	if attr.Typ == meta.TypeFile {
+		n.isFile = true
+	}
+
 	// 调整轮次
 	t.accessNum++
-	if t.accessNum%200 == 0 {
+	if t.accessNum%NumToTuneCapacity == 0 {
 		t.TuneCacheCapacity()
 	}
 
@@ -307,10 +405,20 @@ func (t *FileShadowTree) processOpen(i Ino, attr *Attr) {
 			newCache.accessWindow = append(newCache.accessWindow, uint64(i))
 			t.nodeToCache[f] = newCache
 			n.cacheUnitNode = f
-
 		}
 
 	}
+
+	// 做预取
+	cache, exists := t.nodeToCache[n.cacheUnitNode]
+	if cache.pattern == 's' {
+		t.prefetch(cache, n)
+	}
+
+	// 做剪枝，每个文件夹下保留十个文件节点
+	// 文件节点的唯一作用是，预取时的块迁移，其他时候都用不到文件节点
+	t.prune(f)
+
 }
 
 func (t *FileShadowTree) processRead(ino Ino, offset uint64, size uint32) {
@@ -334,10 +442,13 @@ func (t *FileShadowTree) processRead(ino Ino, offset uint64, size uint32) {
 				unit.cache.used += BlockSize
 				unit.cache.Add(fileBlockPair{ino, i}, BlockSize)
 			} else {
-				t.manuallyRemove(ino, uint64(i*BlockSize), BlockSize)
-				break
+				t.manuallyRemove(ino, i*BlockSize, BlockSize)
 			}
+			file.readBlockIds = append(file.readBlockIds, uint64(i))
 		}
+
+		// 记录文件读块号，为了跨文件预取
+		file.readBlockIds = append(file.readBlockIds, lastIndx)
 
 		if lastIndx == lastBlock {
 			//最后一个块不完整
@@ -373,7 +484,10 @@ func (t *FileShadowTree) processRead(ino Ino, offset uint64, size uint32) {
 			unit.reuseNum++
 		}
 		unit.cache.Add(fileBlock, BlockSize)
+		file.readBlockIds = append(file.readBlockIds, uint64(i))
 	}
+
+	file.readBlockIds = append(file.readBlockIds, lastIndx)
 	// 添加最后一个块
 	if lastIndx == lastBlock {
 		//最后一个块不完整

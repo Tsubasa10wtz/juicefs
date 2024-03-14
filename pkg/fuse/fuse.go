@@ -246,13 +246,14 @@ func (fs *fileSystem) Create(cancel <-chan struct{}, in *fuse.CreateIn, name str
 	return fs.replyEntry(ctx, &out.EntryOut, entry)
 }
 
-func (fs *fileSystem) manuallyOpen(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
+func (fs *fileSystem) manuallyOpen(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (entry *meta.Entry) {
 	// 手动打开一个文件
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
 	if err != 0 {
-		return fuse.Status(err)
+		// 这里和原来的接口略有不同，请注意
+		return nil
 	}
 	out.Fh = fh
 	if vfs.IsSpecialNode(Ino(in.NodeId)) {
@@ -260,7 +261,8 @@ func (fs *fileSystem) manuallyOpen(cancel <-chan struct{}, in *fuse.OpenIn, out 
 	} else if entry.Attr.KeepCache {
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	}
-	return 0
+	// 返回entry给了更多空间
+	return entry
 }
 
 func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
@@ -281,11 +283,24 @@ func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Op
 	return 0
 }
 
+// 用一个读端口来完成缓存的操作
+func (fs *fileSystem) mannuallyRead(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+	// Read记录偏移数，实现块级别管理
+	ctx := fs.newContext(cancel, &in.InHeader)
+	defer releaseContext(ctx)
+	n, err := fs.v.Read(ctx, Ino(in.NodeId), buf, in.Offset, in.Fh)
+	if err != 0 {
+		return nil, fuse.Status(err)
+	}
+	return fuse.ReadResultData(buf[:n]), 0
+}
+
 func (fs *fileSystem) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
 	// Read记录偏移数，实现块级别的管理
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
 	n, err := fs.v.Read(ctx, Ino(in.NodeId), buf, in.Offset, in.Fh)
+	// 记录所读块
 	go fs.t.processRead(Ino(in.NodeId), in.Offset, in.Size)
 	if err != 0 {
 		return nil, fuse.Status(err)
