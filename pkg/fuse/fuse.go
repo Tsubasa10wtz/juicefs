@@ -307,10 +307,10 @@
  }
  
  func (fs *fileSystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) (status fuse.Status) {
-	 if !vfs.IsSpecialNode(Ino(in.NodeId)) {
-		 go fs.t.ProcessOpen(in.NodeId, time.Now().Unix())
-		 fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Open: ", in.NodeId)
-	 }
+	 //if !vfs.IsSpecialNode(Ino(in.NodeId)) {
+	 //	go fs.t.ProcessOpen(in.NodeId, time.Now().Unix())
+	 //	fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Open: ", in.NodeId)
+	 //}
 	 ctx := fs.newContext(cancel, &in.InHeader)
 	 defer releaseContext(ctx)
 	 entry, fh, err := fs.v.Open(ctx, Ino(in.NodeId), in.Flags)
@@ -319,10 +319,10 @@
 	 }
 	 out.Fh = fh
  
-	 if !vfs.IsSpecialNode(Ino(in.NodeId)) {
-		 // go fs.t.ProcessOpen(in.NodeId, time.Now().Unix())
-		 // fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Open: ", in.NodeId)
-	 }
+	 //if !vfs.IsSpecialNode(Ino(in.NodeId)) {
+	 //	// go fs.t.ProcessOpen(in.NodeId, time.Now().Unix())
+	 //	fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Open: ", in.NodeId)
+	 //}
  
 	 if vfs.IsSpecialNode(Ino(in.NodeId)) {
 		 out.OpenFlags |= fuse.FOPEN_DIRECT_IO
@@ -334,8 +334,8 @@
  
  func (fs *fileSystem) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
 	 if !vfs.IsSpecialNode(Ino(in.NodeId)) {
-		 go fs.t.ProcessRead(in.NodeId, in.Offset, in.Size, time.Now().Unix())
-		 fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Read: ", in.NodeId)
+		 go fs.t.ProcessRead1(in.NodeId, in.Offset, in.Size, time.Now().Unix())
+		 // fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Read: ", in.NodeId)
 	 }
 	 ctx := fs.newContext(cancel, &in.InHeader)
 	 defer releaseContext(ctx)
@@ -343,10 +343,10 @@
 	 if err != 0 {
 		 return nil, fuse.Status(err)
 	 }
-	 if !vfs.IsSpecialNode(Ino(in.NodeId)) {
-		 // fs.t.ProcessRead(in.NodeId, in.Offset, in.Size, time.Now().Unix())
-		 // fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Read: ", in.NodeId)
-	 }
+	 //if !vfs.IsSpecialNode(Ino(in.NodeId)) {
+	 //	// fs.t.ProcessRead(in.NodeId, in.Offset, in.Size, time.Now().Unix())
+	 //	// fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "exec a Read: ", in.NodeId)
+	 //}
 	 return fuse.ReadResultData(buf[:n]), 0
  }
  

@@ -29,17 +29,23 @@ const PruneTime = 300     //检查剪枝的时间
 const LeastLengthToJudge = 20
 const TuneTime = 60
 
+// 以字节为单位: * 1024 = KB; * 1024 * 1024 = MB; 1024 * 1024 * 1024 = GB
 const EntrySize = 4 * 1024
-const ReuseWindowSize = 32 * 1024 //重用窗口大小
-const StrideSize = 64 * 1024
-const CapacityToTune = 128 * 1024
-const InitialCapacity = 256 * 1024 //初始缓存单元大小
-const MinCacheSize = 32 * 1024
-const MaxCacheSize = 4096 * 1024 //最大缓存大小，应该根据实际情况调整
-const MinSize = 32 * 1024        //最小缓存单元大小
+const ReuseWindowSize = 128 * 1024 * 1024 //重用窗口大小
+const StrideSize = 64 * 1024 * 1024
+const MinCacheSize = 64 * 1024 * 1024
+const CapacityToTune = 512 * 1024 * 1024      //一次调整的缓存大小
+const InitialCapacity = 256 * 1024 * 1024     //初始缓存单元大小
+const MaxCacheSize = 100 * 1024 * 1024 * 1024 //最大缓存大小，应该根据实际情况调整
 
 const stagingDir = "rawstaging"
+
 const cacheDir = "raw"
+
+var (
+	// 使用sync.Map来安全地存储和管理待删除的文件路径
+	pendingDeletions sync.Map
+)
 
 type Pair struct {
 	First  float64
@@ -88,7 +94,7 @@ type StreamNode struct {
 	childListMu sync.RWMutex // 增加对childList的锁控制，不然可能并发导致同一节点被创建两次
 
 	blocks []chunkObj //针对一个文件节点的信息
-
+	size   uint64     //对文件记录大小，为了在CacheUnit中估计MaxSize中使用（目录记为0）
 }
 
 func NewStreamNode(p string, i uint64, f *StreamNode) *StreamNode {
@@ -97,6 +103,7 @@ func NewStreamNode(p string, i uint64, f *StreamNode) *StreamNode {
 		father:        f,
 		childList:     make([]*StreamNode, 0),
 		inode:         i,
+		size:          0,  //对文件记录大小，为了在CacheUnit中估计MaxSize中使用（目录记为0）
 		cTime:         -1, //最后一次被Lookup的时间
 		accessWindow:  make([]Access, 0),
 		isFile:        false, //	默认是false，如果被open认为是文件
@@ -121,13 +128,15 @@ type StreamTree struct {
 	m                map[uint64]*StreamNode // Ino和*FileShadowNode的映射关系
 	isDatasetBusy    map[string]float64
 	totalCacheSize   uint64 //总缓存大小
-	uuid             string
-	cacheDir         string
-	mountPoint       string
-	nodeUnitDict     map[*StreamNode]*CacheUnit //为每一个节点找到CacheUnit
-	unitList         []*CacheUnit
-	mu               sync.RWMutex
-	inoMu            sync.RWMutex //ino映射关系，即m的锁
+
+	uuid       string
+	cacheDir   string
+	mountPoint string
+
+	nodeUnitDict map[*StreamNode]*CacheUnit //为每一个节点找到CacheUnit
+	unitList     []*CacheUnit
+	mu           sync.RWMutex //nodeUnitDic和unitList
+	inoMu        sync.RWMutex //ino映射关系，即m的锁
 
 	inodeLocks   map[uint64]*sync.Mutex // 不允许并发进程对同一个inode进行ProcessOpen或ProcessRead
 	inodeLocksMu sync.RWMutex           // 用于保护inodeLocks映射的
@@ -159,7 +168,7 @@ func NewStreamTree(fs *fileSystem) *StreamTree {
 	tree.GenerateNoDictAndJudgeUnit(1) //生成根目录的NoDict
 	tree.printTreeStatus()
 	// go tree.CalIOBusyTime()
-	go tree.Prune()
+	//go tree.Prune()
 	// go tree.DispatchServer()
 	go tree.doTraverse()
 	go tree.ProcessCacheUnit() // 处理CacheUnit
@@ -171,12 +180,15 @@ func (t *StreamTree) printTreeStatus() {
 	fmt.Println("StreamTree Status: \n",
 		"MountPoint: ", t.mountPoint, "\n",
 		"UUID: ", t.uuid, "\n",
-		"CacheDir: ", t.cacheDir)
+		"CacheDir: ", t.cacheDir, "\n",
+		"TotalCacheSize: ", t.totalCacheSize)
+
 }
 
 func (t *StreamTree) doTraverse() {
 	for {
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second * 20)
+		fmt.Println("-----------------------------")
 		go t.TraverseTree(t.root, 0)
 
 	}
@@ -280,7 +292,7 @@ type chunkObj struct {
 }
 
 // GetInfoByInode 由一个块读取块信息
-func GetInfoByInode(i uint64) ([]chunkObj, string, error) {
+func GetInfoByInode(i uint64) ([]chunkObj, string, uint64, error) {
 	inode := i
 	//d, err := os.Getwd()
 	//if err != nil {
@@ -294,7 +306,7 @@ func GetInfoByInode(i uint64) ([]chunkObj, string, error) {
 	f, err := openController(d)
 	if err != nil {
 		logger.Errorf("Open control file for %s: %s", d, err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	defer f.Close()
 
@@ -310,7 +322,7 @@ func GetInfoByInode(i uint64) ([]chunkObj, string, error) {
 	_, err = f.Write(wb.Bytes())
 	if err != nil {
 		logger.Fatalf("write message: %s", err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
 	// fmt.Println("reach 2")
@@ -318,7 +330,7 @@ func GetInfoByInode(i uint64) ([]chunkObj, string, error) {
 	data, errno := readProgress(f, func(count, size uint64) {})
 	if errno != 0 {
 		logger.Errorf("failed to get info: %s", syscall.Errno(errno))
-		return nil, "", errno
+		return nil, "", 0, errno
 	}
 
 	// fmt.Println("reach 3")
@@ -327,7 +339,7 @@ func GetInfoByInode(i uint64) ([]chunkObj, string, error) {
 	err = json.Unmarshal(data, &resp)
 	if err != nil {
 		logger.Errorf("json unmarshal error: %s", err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 
 	//if len(resp.Objects) > 0 {
@@ -353,10 +365,10 @@ func GetInfoByInode(i uint64) ([]chunkObj, string, error) {
 	if len(resp.Paths) == 0 {
 		err := errors.New("can't find path")
 		logger.Errorf("error: %s", err)
-		return nil, "", err
+		return nil, "", 0, err
 	}
 	// fmt.Println(resp.Paths[0])
-	return chunks, resp.Paths[0], nil
+	return chunks, resp.Paths[0], resp.Summary.Size, nil
 
 }
 
@@ -486,13 +498,19 @@ func (t *StreamTree) GenerateNoDictAndJudgeUnit(i uint64) {
 
 	// 初始化自编号
 	// 再次判断处理并发
-	if node.noDict == nil {
-		node.noMu.Lock()
-		node.noDict = make(map[string]uint32)
-		for i, s := range names {
-			node.noDict[s] = uint32(i)
-		}
-		node.noMu.Unlock()
+	//if node.noDict == nil {
+	//	node.noMu.Lock()
+	//	node.noDict = make(map[string]uint32)
+	//	for i, s := range names {
+	//		node.noDict[s] = uint32(i)
+	//	}
+	//	node.noMu.Unlock()
+	//}
+
+	// 编号
+	node.noDict = make(map[string]uint32)
+	for i, s := range names {
+		node.noDict[s] = uint32(i)
 	}
 
 	if node.father == nil {
@@ -635,7 +653,7 @@ func (t *StreamTree) doPrefetch(node *StreamNode) {
 }
 
 func (t *StreamTree) ProcessOpenTest(i uint64, timet int64) {
-	blocks, path, err := GetInfoByInode(5)
+	blocks, path, _, err := GetInfoByInode(5)
 	if err != nil {
 		fmt.Println(err)
 	}
@@ -646,7 +664,173 @@ func (t *StreamTree) ProcessOpenTest(i uint64, timet int64) {
 
 }
 
-// TODO:这个函数暂时废弃，重用要关注锁检查
+func (t *StreamTree) ProcessRead1(i uint64, off uint64, size uint32, timet int64) {
+	// 同一个文件节点，串行处理
+	t.inodeLocksMu.Lock()
+	mutex, exists := t.inodeLocks[i]
+	if !exists {
+		mutex = &sync.Mutex{}
+		t.inodeLocks[i] = mutex
+	}
+	t.inodeLocksMu.Unlock()
+
+	var node *StreamNode
+
+	t.inoMu.RLock()
+	n, exists := t.m[i]
+	t.inoMu.RUnlock()
+	if exists {
+		node = n
+	} else {
+		node = t.buildTree(i, timet)
+	}
+
+	// 记录IO_bound功能，从当前节点开始，向上遍历所有父节点
+	for nn := node; nn != nil; nn = nn.father {
+		// 更新当前节点的readTime
+		nn.readMu.Lock()
+		nn.readTime = append(nn.readTime, timet)
+		// 如果readTime长度超过最大值，则移除最早的元素
+		if len(nn.readTime) > MaxReadTimeLength {
+			nn.readTime = nn.readTime[1:] // 移除第一个元素
+		}
+		nn.readMu.Unlock()
+	}
+
+	//fmt.Println(i, ": reach4")
+
+	var accumulatedOffset uint64 = 0
+	var readEnd uint64 = off + uint64(size)
+
+	blocks := node.blocks
+
+	for j, block := range blocks {
+		if accumulatedOffset+uint64(block.Len) > off && accumulatedOffset < readEnd {
+			// 记录块号
+			// 加入观察窗口
+			node.AddAccess(uint32(j), timet)
+			//fmt.Println("block add1: ", j)
+			t.mu.RLock()
+			u, e := t.nodeUnitDict[node.cacheUnitNode]
+			t.mu.RUnlock()
+			if e {
+				u.AddItem(CacheItem{block.Key, block.Size})
+			}
+			//fmt.Println("block add2: ", j)
+		}
+		accumulatedOffset += uint64(block.Len)
+		if accumulatedOffset >= readEnd {
+			break
+		}
+	}
+
+	fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "ProcessRead finish: ", i)
+
+}
+
+func (t *StreamTree) buildTree(i uint64, timet int64) *StreamNode {
+	// 查找给定inode的节点
+	blocks, path, size, err := GetInfoByInode(i)
+	//_, path, err := GetInfoByInode(i)
+	if err != nil {
+		fmt.Printf("Error getting info by inode: %s\n", err)
+		return nil
+	}
+
+	// 将路径拆分为 "/", "bookcorpus", "train"
+	var parts []string
+
+	pathParts := strings.Split(path, "/")
+	for _, part := range pathParts {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+
+	// fmt.Println(parts)
+
+	currentNode := t.root
+	length := len(parts)
+
+	// 从根节点开始逐级向下匹配
+	for k, part := range parts {
+		found := false
+		currentNode.noMu.Lock()
+		if currentNode.noDict == nil {
+			t.GenerateNoDictAndJudgeUnit(currentNode.inode)
+		}
+		currentNode.noMu.Unlock()
+
+		// 要避免同一节点被多个并发协程多次创建
+		currentNode.childListMu.Lock()
+		for _, child := range currentNode.childList {
+			if child.pathName == part+"/" {
+				// 加入观察窗口
+				currentNode.AddAccess(part, timet)
+				currentNode.childListMu.Unlock()
+				// 这里变了currentNode，所以需要释放锁
+				currentNode = child
+				found = true
+				break
+			}
+		}
+
+		// 如果在当前层级没有找到匹配项，创建一个新节点
+		if !found {
+			currentNode.childListMu.Unlock()
+			// 找到当前的这个节点的Inode
+			ino := t.FindInodeByLookup(currentNode.inode, part)
+			// double check:如果映射
+			t.inoMu.Lock()
+			if _, e := t.m[ino]; e {
+				currentNode.AddAccess(part, timet)
+				currentNode = t.m[ino]
+				t.inoMu.Unlock()
+				continue
+			}
+			newNode := NewStreamNode(part, ino, currentNode)
+			t.m[ino] = newNode
+			t.inoMu.Unlock()
+			// 加入观察窗口
+			currentNode.AddAccess(part, timet)
+			if k == length-1 {
+				newNode.isFile = true
+				if newNode.father.cacheUnitNode != nil {
+					newNode.cacheUnitNode = newNode.father.cacheUnitNode
+				} else {
+					newNode.cacheUnitNode = newNode
+					u := NewCacheUnit(newNode, t)
+					go u.GetFileNumsAndSize()
+					t.mu.Lock()
+					t.nodeUnitDict[newNode] = u
+					t.unitList = append(t.unitList, u)
+					t.mu.Unlock()
+				}
+			}
+			t.nodeNum++
+			currentNode.childListMu.Lock()
+			currentNode.childList = append(currentNode.childList, newNode)
+			currentNode.childListMu.Unlock()
+			currentNode = newNode
+		}
+	}
+
+	//fmt.Println(i, ": reach 3")
+
+	//fmt.Println(i, ": reach3")
+
+	// 从文件节点开始记录
+	node := currentNode
+
+	// 这样在read时就不用再查询一次了
+	node.blocks = blocks
+	node.noLower = uint64(len(node.blocks)) //文件下块总数
+	node.size = size
+
+	return node
+
+}
+
 func (t *StreamTree) ProcessOpen(i uint64, timet int64) {
 	//fmt.Println(i, ": reach 1")
 
@@ -665,7 +849,7 @@ func (t *StreamTree) ProcessOpen(i uint64, timet int64) {
 	//fmt.Println(i, ": reach1")
 
 	// 查找给定inode的节点
-	blocks, path, err := GetInfoByInode(i)
+	blocks, path, size, err := GetInfoByInode(i)
 	//_, path, err := GetInfoByInode(i)
 	if err != nil {
 		fmt.Printf("Error getting info by inode: %s\n", err)
@@ -696,17 +880,19 @@ func (t *StreamTree) ProcessOpen(i uint64, timet int64) {
 	// 从根节点开始逐级向下匹配
 	for i, part := range parts {
 		found := false
+		currentNode.noMu.Lock()
 		if currentNode.noDict == nil {
 			t.GenerateNoDictAndJudgeUnit(currentNode.inode)
 		}
+		currentNode.noMu.Unlock()
 
 		// 要避免同一节点被多个并发协程多次创建
-		currentNode.childListMu.RLock()
+		currentNode.childListMu.Lock()
 		for _, child := range currentNode.childList {
 			if child.pathName == part+"/" {
 				// 加入观察窗口
 				currentNode.AddAccess(part, timet)
-				currentNode.childListMu.RUnlock()
+				currentNode.childListMu.Unlock()
 				// 这里变了currentNode，所以需要释放锁
 				currentNode = child
 				found = true
@@ -716,10 +902,20 @@ func (t *StreamTree) ProcessOpen(i uint64, timet int64) {
 
 		// 如果在当前层级没有找到匹配项，创建一个新节点
 		if !found {
-			currentNode.childListMu.RUnlock()
+			currentNode.childListMu.Unlock()
 			// 找到当前的这个节点的Inode
 			ino := t.FindInodeByLookup(currentNode.inode, part)
+			// double check:如果映射
+			t.inoMu.Lock()
+			if _, e := t.m[ino]; e {
+				currentNode.AddAccess(part, timet)
+				currentNode = t.m[ino]
+				t.inoMu.Unlock()
+				continue
+			}
 			newNode := NewStreamNode(part, ino, currentNode)
+			t.m[ino] = newNode
+			t.inoMu.Unlock()
 			// 加入观察窗口
 			currentNode.AddAccess(part, timet)
 			if i == length-1 {
@@ -737,9 +933,6 @@ func (t *StreamTree) ProcessOpen(i uint64, timet int64) {
 				}
 			}
 			t.nodeNum++
-			t.inoMu.Lock()
-			t.m[ino] = newNode
-			t.inoMu.Unlock()
 			currentNode.childListMu.Lock()
 			currentNode.childList = append(currentNode.childList, newNode)
 			currentNode.childListMu.Unlock()
@@ -757,6 +950,7 @@ func (t *StreamTree) ProcessOpen(i uint64, timet int64) {
 	// 这样在read时就不用再查询一次了
 	node.blocks = blocks
 	node.noLower = uint64(len(node.blocks)) //文件下块总数
+	node.size = size
 
 	//fmt.Println("node: ", node.pathName)
 
@@ -778,16 +972,18 @@ func (t *StreamTree) ProcessRead(i uint64, off uint64, size uint32, timet int64)
 	mutex, exists := t.inodeLocks[i]
 	if !exists {
 		// 这个inode的锁不存在说明没open，这是不应该出现的情况
-		fmt.Println("error: may be not open")
+		fmt.Println(i, ", error: may be not open")
 	}
 	t.inodeLocksMu.RUnlock()
 
-	// 暂定为inode串行执行，这也是正常的，多个Read并发访问本身会出现问题
+	// inode串行执行，这也是正常的，多个Read并发访问本身会出现问题
 	// 因为这个复杂度是线性的，应该执行很快
 	mutex.Lock()
 	defer mutex.Unlock()
 
+	t.inoMu.Lock()
 	node := t.m[i]
+	t.inoMu.Unlock()
 
 	// 记录IO_bound功能，从当前节点开始，向上遍历所有父节点
 	for n := node; n != nil; n = n.father {
@@ -821,12 +1017,12 @@ func (t *StreamTree) ProcessRead(i uint64, off uint64, size uint32, timet int64)
 			// 加入观察窗口
 			node.AddAccess(uint32(j), timet)
 			//fmt.Println("block add1: ", j)
-			//t.mu.RLock()
-			//u, exists := t.nodeUnitDict[node.cacheUnitNode]
-			//t.mu.RUnlock()
-			//if exists {
-			//	u.AddItem(CacheItem{block.Key, block.Size})
-			//}
+			t.mu.RLock()
+			u, e := t.nodeUnitDict[node.cacheUnitNode]
+			t.mu.RUnlock()
+			if e {
+				u.AddItem(CacheItem{block.Key, block.Size})
+			}
 			//fmt.Println("block add2: ", j)
 		}
 		accumulatedOffset += uint64(block.Len)
@@ -963,8 +1159,15 @@ func (t *StreamTree) pruneNode(node *StreamNode, now int64) {
 		return
 	}
 
+	// TODO：check两个版本的区别
+	//// 如果当前节点最后一次读取时间超过60秒，或者从未读取过且创建时间超过60秒
+	//if (len(node.readTime) > 0 && now-node.readTime[len(node.readTime)-1] > 10) || (len(node.readTime) == 0 && now-node.cTime > 10) {
+	//	// 直接剪掉此节点及其所有子节点
+	//	t.recursiveRemoveNode(node)
+	//	return // 剪枝后返回，不再对子节点进行递归判断
+	//}
 	// 如果当前节点最后一次读取时间超过60秒，或者从未读取过且创建时间超过60秒
-	if (len(node.readTime) > 0 && now-node.readTime[len(node.readTime)-1] > 60) || (len(node.readTime) == 0 && now-node.cTime > 60) {
+	if len(node.readTime) > 0 && now-node.readTime[len(node.readTime)-1] > 10 {
 		// 直接剪掉此节点及其所有子节点
 		t.recursiveRemoveNode(node)
 		return // 剪枝后返回，不再对子节点进行递归判断
@@ -987,7 +1190,7 @@ func (t *StreamTree) recursiveRemoveNode(node *StreamNode) {
 		t.recursiveRemoveNode(child)
 	}
 
-	// 如果此节点有父节点，从父节点的子列表中移除此节点
+	// 如果此节点有父节点(考虑root)，从父节点的子列表中移除此节点
 	if node.father != nil {
 		node.father.childListMu.Lock()
 		for i, child := range node.father.childList {
@@ -1003,8 +1206,16 @@ func (t *StreamTree) recursiveRemoveNode(node *StreamNode) {
 
 	// 从映射中删除
 	t.inoMu.Lock()
-	delete(t.m, node.inode)
+	if _, exists := t.m[node.inode]; exists {
+		delete(t.m, node.inode)
+	}
 	t.inoMu.Unlock()
+
+	t.inodeLocksMu.Lock()
+	if _, exists := t.inodeLocks[node.inode]; exists {
+		delete(t.inodeLocks, node.inode)
+	}
+	t.inodeLocksMu.Unlock()
 
 	// 更新节点计数
 	t.nodeNum--
@@ -1016,6 +1227,14 @@ func (t *StreamTree) ProcessCacheUnit() {
 	for {
 		time.Sleep(TuneTime * time.Second)
 
+		fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "before tuning: ")
+
+		for _, unit := range t.unitList {
+			node := unit.node
+			path := getPath(node)
+			fmt.Println("path: ", path, ", capacity: ", unit.capacity)
+		}
+
 		// 模式判别
 		for _, unit := range t.unitList {
 			unit.pattern = judgePattern(unit.node)
@@ -1024,12 +1243,14 @@ func (t *StreamTree) ProcessCacheUnit() {
 		// 调整缓存大小
 		t.TuneCacheCapacity()
 
-		fmt.Println("unit num: ", len(t.unitList))
+		//fmt.Println("unit num: ", len(t.unitList))
+
+		fmt.Println(time.Now().Format("2006/01/02 15:04:05"), "after tuning: ")
 
 		for _, unit := range t.unitList {
 			node := unit.node
 			path := getPath(node)
-			fmt.Println("path: ", path, ", files: ", unit.files, ", pattern: ", unit.pattern, ", margin: ", unit.margin)
+			fmt.Println("path: ", path, ", capacity: ", unit.capacity, ", files: ", unit.files, ", pattern: ", unit.pattern, ", margin: ", unit.margin)
 		}
 	}
 }
@@ -1044,31 +1265,60 @@ func getPath(node *StreamNode) string {
 }
 
 func (t *StreamTree) TuneCacheCapacity() {
-	// 创建一个用于存储已经确定模式的CacheUnit的切片
+	// TODO: 最大size，最小size
 
-	// 遍历已经记录的最后一级节点
-	for _, c := range t.unitList {
-		c.CalculateMarginBenefit()
+	// 因为并行处理，可能出现一个cache的files和size还没计算完正好赶上一次tune的情况
+	// 没有计算完的话，不参与本次调整
+	var unitList = make([]*CacheUnit, 0)
+
+	// 先筛选一轮，筛掉files和size没统计完的unit
+	// 其他的计算margin benefit后加入unitList
+	for _, u := range t.unitList {
+		// 说明file和size没统计完成， 不参与本轮计算
+		if u.files == 0 && u.size == 0 {
+			continue
+		} else {
+			avgSize := float64(u.size) / float64(u.files)
+			if avgSize < float64(4*1024*1024) {
+				//小文件：最大大小是文件总大小
+				u.maxSize = u.size
+			} else {
+				//大文件：统计叶子节点（文件），总大小
+				u.maxSize = SumLeafSize(u.node)
+			}
+			//计算边际收益，加入unitList
+			u.CalculateMarginBenefit()
+			unitList = append(unitList, u)
+		}
 	}
 
 	// 对cacheWithPattern进行排序
-	sort.Slice(t.unitList, func(i, j int) bool {
-		return t.unitList[i].margin > t.unitList[j].margin
+	sort.Slice(unitList, func(i, j int) bool {
+		return unitList[i].margin > unitList[j].margin
 	})
 
 	var cacheToTuneByStep []*CacheUnit
-
 	// 遍历已经确定模式的缓存单元
-	for _, c := range t.unitList {
-		if c.margin == -1.0 {
-			if c.pattern == 1 {
-				//TODO:根据预取调整，不一定是定值
-				goalSize := StrideSize
-				t.freeCapacity += c.capacity - uint64(goalSize)
-				c.TuneCapacityAndFree(uint64(goalSize))
+	for _, u := range unitList {
+		if u.margin == -1.0 {
+			// Stride Pattern的情况
+			//TODO:根据预取调整，不一定是定值
+			goalSize := min(uint64(StrideSize), u.maxSize)
+			if u.capacity > goalSize {
+				t.freeCapacity += u.capacity - goalSize
+			} else {
+				t.freeCapacity -= goalSize - u.capacity
 			}
+			u.TuneCapacityAndFree(goalSize)
 		} else {
-			cacheToTuneByStep = append(cacheToTuneByStep, c)
+			// 先把超出最大容量（可以理解为数据集大小）的回收一下
+			if u.capacity >= u.maxSize {
+				goalSize := u.maxSize
+				t.freeCapacity += u.capacity - goalSize
+				u.TuneCapacityAndFree(goalSize)
+			}
+			cacheToTuneByStep = append(cacheToTuneByStep, u)
+
 		}
 	}
 
@@ -1084,25 +1334,22 @@ func (t *StreamTree) TuneCacheCapacity() {
 	// 从后向前开始回收
 	if t.freeCapacity < sizeToTuneThisRound {
 		for i := len(cacheToTuneByStep) - 1; i >= 0; i-- {
-			c := cacheToTuneByStep[i]
-			sizeCanRecycle := min(c.capacity-MinCacheSize, sizeToTuneThisRound-t.freeCapacity)
+			u := cacheToTuneByStep[i]
+			sizeCanRecycle := min(u.capacity-MinCacheSize, sizeToTuneThisRound-t.freeCapacity)
 			goalSize[i] -= sizeCanRecycle
 			t.freeCapacity += sizeCanRecycle
-			//回收足够就可以退出
+			//回收足够的内存就可以退出
 			if t.freeCapacity == sizeToTuneThisRound {
 				break
 			}
 		}
 	}
 
-	// 从前向后开始分配
-	sizeRemain := sizeToTuneThisRound
-	for i := range cacheToTuneByStep {
-		sizeCanAllocate := min(sizeRemain, min(CapacityToTune, MaxCacheSize-goalSize[i]))
-		sizeRemain -= sizeCanAllocate
+	for i, u := range cacheToTuneByStep {
+		sizeCanAllocate := min(t.freeCapacity, u.maxSize-goalSize[i])
 		t.freeCapacity -= sizeCanAllocate
 		goalSize[i] += sizeCanAllocate
-		if sizeRemain == 0 {
+		if t.freeCapacity == 0 {
 			break
 		}
 	}
@@ -1116,7 +1363,7 @@ func (t *StreamTree) TuneCacheCapacity() {
 // judgePattern
 func judgePattern(node *StreamNode) uint8 {
 	accessWindow := node.accessWindow
-	fmt.Println(getPath(node), " accessWindow: ", accessWindow)
+	//fmt.Println(getPath(node), " accessWindow: ", accessWindow)
 
 	var convertedWindow []uint32
 
@@ -1140,7 +1387,7 @@ func judgePattern(node *StreamNode) uint8 {
 		}
 	}
 
-	fmt.Println(getPath(node), " convertedWindow: ", convertedWindow)
+	//fmt.Println(getPath(node), " convertedWindow: ", convertedWindow)
 
 	if JudgeIfStridePattern(convertedWindow) {
 		return 1
@@ -1225,7 +1472,7 @@ func CalculateGapDistributionGaussian(window []uint32) Pair {
 	for i := size - 1; i >= size-10; i-- {
 		oldAvg, oldStd := avg, std
 		gap := float64(absDiff(window[i], window[i-1]))
-		fmt.Println("gap: ", gap)
+		//fmt.Println("gap: ", gap)
 		var newAvg, newStd float64
 		if nrSample == 0 {
 			newAvg = gap
@@ -1247,7 +1494,7 @@ func JudgeDistribution(p Pair, n uint64) bool {
 	if p.First > float64(n)*0.26 && p.First < float64(n)*0.45 {
 		return true
 	}
-	fmt.Println("avg: ", p.First)
+	//fmt.Println("avg: ", p.First)
 	// TODO:增加方差判别
 	return false
 }
@@ -1287,6 +1534,7 @@ type CacheUnit struct {
 	size        uint64 //总大小，通过GetFileNumsAndSize递归获得
 	acc         uint32 //本轮总访问次数
 	reuse       uint32 //被重用数量
+	maxSize     uint64 //每轮的最大大小
 	mu          sync.Mutex
 }
 
@@ -1294,7 +1542,7 @@ func NewCacheUnit(node *StreamNode, tree *StreamTree) *CacheUnit {
 	u := &CacheUnit{
 		tree:     tree,
 		node:     node,
-		capacity: 1024 * 1024 * 1024,
+		capacity: InitialCapacity, //先给一个初始的大小
 		used:     0,
 		margin:   0,
 		files:    0,
@@ -1302,6 +1550,7 @@ func NewCacheUnit(node *StreamNode, tree *StreamTree) *CacheUnit {
 		acc:      0,
 		reuse:    0,
 		pattern:  0,
+		maxSize:  0,
 	}
 
 	u.cache = NewLRU(u.capacity)
@@ -1322,13 +1571,20 @@ func (u *CacheUnit) GetFileNumsAndSize() {
 
 func (u *CacheUnit) AddItem(item CacheItem) {
 	// 记录一次访问，为了衡量访问速度
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	//fmt.Println("cacheunit: ", u.node.pathName, "\n",
+	//	"item key: ", item.key, "\n",
+	//	"size: ", item.value, "\n",
+	//	"unit capacity: ", u.cache.capacity, "\n",
+	//	"unit used: ", u.cache.used)
+	//fmt.Println(item.key, ": reach 1")
 
 	//trimmed := strings.TrimPrefix(item.key, "jfs/")
 	//path := filepath.Join(u.tree.cacheDir, cacheDir, trimmed)
 	//fmt.Println(path, ": begin")
 	u.acc += 1
-	u.mu.Lock()
-	defer u.mu.Unlock()
+	//fmt.Println(item.key, ": reach 2")
 	// 检查item是否已经在缓存中
 	if elem, found := u.cache.elements[item.key]; found {
 		// 如果已经在缓存中，移动到链表前面
@@ -1340,6 +1596,8 @@ func (u *CacheUnit) AddItem(item CacheItem) {
 		//elem.Value.(*CacheItem).value = item.value + EntrySize
 		return
 	}
+
+	//fmt.Println(item.key, ": reach 3")
 
 	// 不在u.cache中，但是在reuseWindow中，重用次数+1
 	if _, found := u.cache.elements[item.key]; found {
@@ -1353,12 +1611,15 @@ func (u *CacheUnit) AddItem(item CacheItem) {
 			//TODO:是否需要滞后删除
 			trimmed := strings.TrimPrefix(item.key, "jfs/")
 			path := filepath.Join(u.tree.cacheDir, cacheDir, trimmed)
-			go os.Remove(path)
+			addToPendingDeletions(path, 2)
+			// go os.Remove(path)
 			return
 		}
-		// 移除最不常用的zot
+		// 移除最不常用的块
 		u.removeOldestItem()
 	}
+
+	//fmt.Println(item.key, ": reach 4")
 
 	// 将新项添加到链表前面
 	newElem := u.cache.list.PushFront(&item)
@@ -1366,6 +1627,8 @@ func (u *CacheUnit) AddItem(item CacheItem) {
 	u.cache.elements[item.key] = newElem
 	// 更新已用空间
 	u.cache.used += uint64(item.value) + EntrySize
+
+	//fmt.Println(item.key, ": reach 5")
 
 	//fmt.Println(path, ": end")
 
@@ -1378,10 +1641,12 @@ func (u *CacheUnit) removeOldestItem() {
 		item := oldest.Value.(*CacheItem)
 		u.cache.used -= uint64(item.value) + EntrySize
 		u.cache.list.Remove(oldest)
+		fmt.Println("delete key: ", item.key)
 		delete(u.cache.elements, item.key)
 		trimmed := strings.TrimPrefix(item.key, "jfs/")
 		path := filepath.Join(u.tree.cacheDir, cacheDir, trimmed)
-		go os.Remove(path)
+		addToPendingDeletions(path, 2)
+		// go os.Remove(path)
 
 		// 三种pattern都维护ReusWindow，这是为了防止模式的转换
 		u.addToReuseWindow(*item)
@@ -1415,6 +1680,7 @@ func (u *CacheUnit) removeOldestFromReuseWindow() {
 	}
 }
 
+// SumLeafNoLower 统计所有叶子节点（文件）的总文件块数
 func SumLeafNoLower(node *StreamNode) uint64 {
 	if node == nil {
 		return 0
@@ -1432,6 +1698,24 @@ func SumLeafNoLower(node *StreamNode) uint64 {
 	return sum
 }
 
+// SumLeafSize 统计所有叶子节点（文件）的大小
+func SumLeafSize(node *StreamNode) uint64 {
+	if node == nil {
+		return 0
+	}
+	// Check if the node is a leaf node (no children)
+	if len(node.childList) == 0 {
+		// This is a leaf node
+		return node.size
+	}
+	// If not a leaf, sum noLower for all leaf children
+	var sum uint64 = 0
+	for _, child := range node.childList {
+		sum += SumLeafSize(child)
+	}
+	return sum
+}
+
 func (u *CacheUnit) CalculateMarginBenefit() {
 	switch u.pattern {
 	case 1:
@@ -1440,7 +1724,6 @@ func (u *CacheUnit) CalculateMarginBenefit() {
 
 	// 统一到减少的未命中次数
 	case 2:
-		fmt.Println("cal!")
 		// 估计块数量， 以及能够带来的命中率
 		avgSize := float64(u.size) / float64(u.files)
 
@@ -1449,8 +1732,8 @@ func (u *CacheUnit) CalculateMarginBenefit() {
 		// 4 * 1024 * 1024 bytes = 4MB
 		if avgSize < float64(4*1024*1024) {
 			// 小文件数据集
-			fmt.Println("small files!")
-			fmt.Println("files: ", u.files, "avgSize: ", avgSize, "acc: ", u.acc)
+			//fmt.Println("small files!")
+			//fmt.Println("files: ", u.files, "avgSize: ", avgSize, "acc: ", u.acc)
 			u.margin = (1 / float64(u.files)) / avgSize * float64(u.acc)
 		} else {
 			// 大文件数据集, 估计值
@@ -1468,6 +1751,9 @@ func (u *CacheUnit) CalculateMarginBenefit() {
 }
 
 func (u *CacheUnit) TuneCapacityAndFree(goalSize uint64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
 	// 如果是扩容，直接更新 cacheSize
 	if goalSize > u.capacity {
 		u.capacity = goalSize
@@ -1491,8 +1777,9 @@ func (u *CacheUnit) TuneCapacityAndFree(goalSize uint64) {
 		// 从缓存中移除最老的条目。
 		oldest := u.cache.list.Back()
 		if oldest == nil {
-			break // 没有更多的项可以移除。
+			break // 没有更多的项可以移除, 以为着缓存里没有任何条目
 		}
+
 		item := oldest.Value.(*CacheItem)
 		u.cache.used -= uint64(item.value) + EntrySize
 		u.cache.list.Remove(oldest)
@@ -1502,12 +1789,75 @@ func (u *CacheUnit) TuneCapacityAndFree(goalSize uint64) {
 		// TODO: 是否需要滞后
 		trimmed := strings.TrimPrefix(item.key, "jfs/")
 		path := filepath.Join(u.tree.cacheDir, cacheDir, trimmed)
-		os.Remove(path)
+		addToPendingDeletions(path, 2)
+		//go os.Remove(path)
 
 		// 重新计算还需要释放的容量。
 		capacityToFree = u.cache.used - goalSize
 	}
 
 	u.capacity = goalSize
+	// TODO:这一句可能还要检查
+	u.cache.capacity = u.capacity
 
+}
+
+//func (t *StreamTree) remove(key string) {
+//	trimmed := strings.TrimPrefix(key, "jfs/")
+//	path := filepath.Join(t.cacheDir, cacheDir, trimmed)
+//
+//	// 尝试删除文件
+//	err := os.Remove(path)
+//	if err != nil {
+//		if os.IsNotExist(err) {
+//			// 如果文件不存在，等待一段时间后重试
+//			time.Sleep(1 * time.Second) // 延迟1秒再次删除
+//			err = os.Remove(path)
+//		}
+//	}
+//}
+
+type deleteEntry struct {
+	path        string
+	attempt     int
+	maxAttempts int
+}
+
+// addToPendingDeletions 添加路径到待删除映射中
+func addToPendingDeletions(path string, maxAttempts int) {
+	pendingDeletions.Store(path, deleteEntry{
+		path:        path,
+		attempt:     0,
+		maxAttempts: maxAttempts,
+	})
+}
+
+// removeFile 定期尝试删除文件
+func removeFile() {
+	ticker := time.NewTicker(5 * time.Second) // 每10秒执行一次
+	defer ticker.Stop()
+
+	for range ticker.C {
+		pendingDeletions.Range(func(key, value interface{}) bool {
+			entry := value.(deleteEntry)
+			if err := os.Remove(entry.path); err != nil {
+				// 如果删除失败，增加尝试次数
+				entry.attempt++
+				fmt.Printf("Failed to remove %s, attempt %d\n", entry.path, entry.attempt)
+				if entry.attempt >= entry.maxAttempts {
+					// 达到最大尝试次数，放弃删除
+					fmt.Printf("Giving up on %s after %d attempts\n", entry.path, entry.attempt)
+					pendingDeletions.Delete(key)
+				} else {
+					// 更新entry信息
+					pendingDeletions.Store(key, entry)
+				}
+			} else {
+				// 如果成功删除，从映射中移除这个路径
+				fmt.Printf("Successfully removed %s\n", entry.path)
+				pendingDeletions.Delete(key)
+			}
+			return true // 继续迭代
+		})
+	}
 }
